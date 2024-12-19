@@ -18,7 +18,7 @@ To make sure `mkosi` doesn't try to build systemd from source during the image b
 process, you can add the following to `mkosi.local.conf`:
 
 ```
-[Content]
+[Build]
 Environment=NO_BUILD=1
 ```
 
@@ -146,6 +146,10 @@ expression.
 that make use of `run_testcases`.
 
 `TEST_SKIP`: takes a space separated list of tests to skip.
+
+`TEST_SKIP_SUBTEST=subtest`: takes a space separated list of subtests to skip.
+
+`TEST_SKIP_TESTCASE=testcase`: takes a space separated list of testcases to skip.
 
 ## Ubuntu CI
 
