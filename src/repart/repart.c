@@ -62,6 +62,7 @@
 #include "pretty-print.h"
 #include "process-util.h"
 #include "random-util.h"
+#include "ratelimit.h"
 #include "resize-fs.h"
 #include "rm-rf.h"
 #include "set.h"
@@ -428,6 +429,9 @@ typedef struct Partition {
 
         PartitionEncryptedVolume *encrypted_volume;
 
+        unsigned last_percent;
+        RateLimit progress_ratelimit;
+
         char *supplement_for_name;
         struct Partition *supplement_for, *supplement_target_for;
         struct Partition *suppressing;
@@ -603,6 +607,8 @@ static Partition *partition_new(void) {
                 .verity_data_block_size = UINT64_MAX,
                 .verity_hash_block_size = UINT64_MAX,
                 .add_validatefs = -1,
+                .last_percent = UINT_MAX,
+                .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
         };
 
         return p;
@@ -921,7 +927,7 @@ static uint64_t partition_min_size(const Context *context, const Partition *p) {
                 return p->current_size;
         }
 
-        if (IN_SET(p->type.designator, PARTITION_ROOT_VERITY_SIG, PARTITION_USR_VERITY_SIG))
+        if (partition_designator_is_verity_sig(p->type.designator))
                 return VERITY_SIG_SIZE;
 
         sz = p->current_size != UINT64_MAX ? p->current_size : HARD_MIN_SIZE;
@@ -967,7 +973,7 @@ static uint64_t partition_max_size(const Context *context, const Partition *p) {
                 return p->current_size;
         }
 
-        if (p->verity == VERITY_SIG)
+        if (partition_designator_is_verity_sig(p->type.designator))
                 return VERITY_SIG_SIZE;
 
         override_max = p->suppressing ? MIN(p->size_max, p->suppressing->size_max) : p->size_max;
@@ -1118,7 +1124,6 @@ static bool context_allocate_partitions(Context *context, uint64_t *ret_largest_
 
                 /* How much do we need to fit? */
                 required = partition_min_size_with_padding(context, p);
-                assert(required % context->grain_size == 0);
 
                 /* For existing partitions, we should verify that they'll actually fit */
                 if (PARTITION_EXISTS(p)) {
@@ -2607,9 +2612,7 @@ static int partition_read_definition(Partition *p, const char *path, const char 
         }
 
         /* Verity partitions are read only, let's imply the RO flag hence, unless explicitly configured otherwise. */
-        if ((IN_SET(p->type.designator,
-                    PARTITION_ROOT_VERITY,
-                    PARTITION_USR_VERITY) || p->verity == VERITY_DATA) && p->read_only < 0)
+        if ((partition_designator_is_verity(p->type.designator) || p->verity == VERITY_DATA) && p->read_only < 0)
                 p->read_only = true;
 
         /* Default to "growfs" on, unless read-only */
@@ -4800,7 +4803,7 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
                         r = tpm2_calculate_sealing_policy(
                                         arg_tpm2_hash_pcr_values,
                                         arg_tpm2_n_hash_pcr_values,
-                                        /* pubkey= */ NULL,      /* Turn this one off for the 2nd shard */
+                                        /* public= */ NULL,      /* Turn this one off for the 2nd shard */
                                         /* use_pin= */ false,
                                         &pcrlock_policy,         /* But turn this one on */
                                         policy_hash + 1);
@@ -5270,18 +5273,32 @@ static int partition_format_verity_sig(Context *context, Partition *p) {
 
 static int progress_bytes(uint64_t n_bytes, void *userdata) {
         Partition *p = ASSERT_PTR(userdata);
+        unsigned percent;
 
         p->copy_blocks_done += n_bytes;
 
+        /* Catch division by zero. */
+        if (p->copy_blocks_done >= p->copy_blocks_size)
+                percent = 100;
+        else
+                percent = (unsigned) (100.0 * (double) p->copy_blocks_done / (double) p->copy_blocks_size);
+
+        if (percent == p->last_percent)
+                return 0;
+
+        if (!ratelimit_below(&p->progress_ratelimit))
+                return 0;
+
         (void) draw_progress_barf(
-                        p->copy_blocks_done >= p->copy_blocks_size ? 100.0 : /* catch division be zero */
-                        100.0 * (double) p->copy_blocks_done / (double) p->copy_blocks_size,
+                        percent,
                         "%s %s %s %s/%s",
                         strna(p->copy_blocks_path),
                         glyph(GLYPH_ARROW_RIGHT),
                         strna(p->definition_path),
                         FORMAT_BYTES(p->copy_blocks_done),
                         FORMAT_BYTES(p->copy_blocks_size));
+
+        p->last_percent = percent;
 
         return 0;
 }
@@ -5306,7 +5323,7 @@ static int context_copy_blocks(Context *context) {
                         continue;
 
                 /* For offline signing case */
-                if (!set_isempty(arg_verity_settings) && IN_SET(p->type.designator, PARTITION_ROOT_VERITY_SIG, PARTITION_USR_VERITY_SIG))
+                if (!set_isempty(arg_verity_settings) && partition_designator_is_verity_sig(p->type.designator))
                         return partition_format_verity_sig(context, p);
 
                 if (p->copy_blocks_fd < 0)
@@ -6279,7 +6296,7 @@ static int context_mkfs(Context *context) {
                         continue;
 
                 /* For offline signing case */
-                if (!set_isempty(arg_verity_settings) && IN_SET(p->type.designator, PARTITION_ROOT_VERITY_SIG, PARTITION_USR_VERITY_SIG))
+                if (!set_isempty(arg_verity_settings) && partition_designator_is_verity_sig(p->type.designator))
                         return partition_format_verity_sig(context, p);
 
                 /* Minimized partitions will use the copy blocks logic so skip those here. */
@@ -7124,7 +7141,7 @@ static int resolve_copy_blocks_auto_candidate(
         _cleanup_(blkid_free_probep) blkid_probe b = NULL;
         _cleanup_close_ int fd = -EBADF;
         _cleanup_free_ char *p = NULL;
-        const char *pttype, *t;
+        const char *pttype;
         sd_id128_t pt_parsed, u;
         blkid_partition pp;
         dev_t whole_devno;
@@ -7197,16 +7214,10 @@ static int resolve_copy_blocks_auto_candidate(
                 return false;
         }
 
-        t = blkid_partition_get_type_string(pp);
-        if (isempty(t)) {
-                log_debug("Partition %u:%u has no type on '%s'.",
-                          major(partition_devno), minor(partition_devno), p);
-                return false;
-        }
-
-        r = sd_id128_from_string(t, &pt_parsed);
+        r = blkid_partition_get_type_id128(pp, &pt_parsed);
         if (r < 0) {
-                log_debug_errno(r, "Failed to parse partition type \"%s\": %m", t);
+                log_debug_errno(r, "Failed to read partition type UUID of partition %u:%u: %m",
+                                major(partition_devno), minor(partition_devno));
                 return false;
         }
 
@@ -7235,6 +7246,82 @@ static int resolve_copy_blocks_auto_candidate(
                 *ret_uuid = u;
 
         return true;
+}
+
+static int resolve_copy_blocks_auto_candidate_harder(
+                dev_t start_devno,
+                GptPartitionType partition_type,
+                dev_t restrict_devno,
+                dev_t *ret_found_devno,
+                sd_id128_t *ret_uuid) {
+
+        _cleanup_(sd_device_unrefp) sd_device *d = NULL, *nd = NULL;
+        int r;
+
+        /* A wrapper around resolve_copy_blocks_auto_candidate(), but looks for verity/verity-sig associated
+         * partitions, too. i.e. if the input is a data or verity partition, will try to find the
+         * verity/verity-sig partition for it, based on udev metadata. */
+
+        const char *property;
+        if (partition_designator_is_verity(partition_type.designator))
+                property = "ID_DISSECT_PART_VERITY_DEVICE";
+        else if (partition_designator_is_verity_sig(partition_type.designator))
+                property = "ID_DISSECT_PART_VERITY_SIG_DEVICE";
+        else
+                goto not_found;
+
+        r = sd_device_new_from_devnum(&d, 'b', start_devno);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate device object for " DEVNUM_FORMAT_STR ": %m", DEVNUM_FORMAT_VAL(start_devno));
+
+        const char *node;
+        r = sd_device_get_property_value(d, property, &node);
+        if (r == -ENOENT) {
+                log_debug_errno(r, "Property %s not set on " DEVNUM_FORMAT_STR ", skipping.", property, DEVNUM_FORMAT_VAL(start_devno));
+                goto not_found;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to read property %s from device " DEVNUM_FORMAT_STR ": %m", property, DEVNUM_FORMAT_VAL(start_devno));
+
+        r = sd_device_new_from_devname(&nd, node);
+        if (ERRNO_IS_NEG_DEVICE_ABSENT(r)) {
+                log_debug_errno(r, "Device %s referenced in %s property not found, skipping: %m", node, property);
+                goto not_found;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate device object for '%s': %m", node);
+
+        r = device_in_subsystem(nd, "block");
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine if '%s' is a block device: %m", node);
+        if (r == 0) {
+                log_debug("Device referenced by %s property of %s does not refer to block device, refusing.", property, node);
+                goto not_found;
+        }
+
+        dev_t found_devno = 0;
+        r = sd_device_get_devnum(nd, &found_devno);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get device number for '%s': %m", node);
+
+        r = resolve_copy_blocks_auto_candidate(found_devno, partition_type, restrict_devno, ret_uuid);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                goto not_found;
+
+        if (ret_found_devno)
+                *ret_found_devno = found_devno;
+
+        return 1;
+
+not_found:
+        if (ret_found_devno)
+                *ret_found_devno = 0;
+        if (ret_uuid)
+                *ret_uuid = SD_ID128_NULL;
+
+        return 0;
 }
 
 static int find_backing_devno(
@@ -7297,30 +7384,41 @@ static int resolve_copy_blocks_auto(
          * partitions in the host, using the appropriate directory as key and ensuring that the partition
          * type matches. */
 
-        if (type.designator == PARTITION_ROOT)
+        switch (type.designator) {
+
+        case PARTITION_ROOT:
+        case PARTITION_ROOT_VERITY:
+        case PARTITION_ROOT_VERITY_SIG:
                 try1 = "/";
-        else if (type.designator == PARTITION_USR)
+                break;
+
+        case PARTITION_USR:
+        case PARTITION_USR_VERITY:
+        case PARTITION_USR_VERITY_SIG:
                 try1 = "/usr/";
-        else if (type.designator == PARTITION_ROOT_VERITY)
-                try1 = "/";
-        else if (type.designator == PARTITION_USR_VERITY)
-                try1 = "/usr/";
-        else if (type.designator == PARTITION_ESP) {
+                break;
+
+        case PARTITION_ESP:
                 try1 = "/efi/";
                 try2 = "/boot/";
-        } else if (type.designator == PARTITION_XBOOTLDR)
+                break;
+
+        case PARTITION_XBOOTLDR:
                 try1 = "/boot/";
-        else
+                break;
+
+        default:
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                       "Partition type " SD_ID128_FORMAT_STR " not supported from automatic source block device discovery.",
-                                       SD_ID128_FORMAT_VAL(type.uuid));
+                                       "Partition type %s not supported from automatic source block device discovery.",
+                                       strna(partition_designator_to_string(type.designator)));
+        }
 
         r = find_backing_devno(try1, root, &devno);
         if (r == -ENOENT && try2)
                 r = find_backing_devno(try2, root, &devno);
         if (r < 0)
-                return log_error_errno(r, "Failed to resolve automatic CopyBlocks= path for partition type " SD_ID128_FORMAT_STR ", sorry: %m",
-                                       SD_ID128_FORMAT_VAL(type.uuid));
+                return log_error_errno(r, "Failed to resolve automatic CopyBlocks= path for partition type %s, sorry: %m",
+                                       partition_designator_to_string(type.designator));
 
         xsprintf_sys_block_path(p, "/slaves", devno);
         d = opendir(p);
@@ -7367,11 +7465,26 @@ static int resolve_copy_blocks_auto(
                                 return r;
                         if (r > 0) {
                                 /* We found a matching one! */
-                                if (found != 0)
+                                if (found != 0 && found != sl)
+                                        return log_error_errno(SYNTHETIC_ERRNO(ENOTUNIQ),
+                                                               "Multiple matching partitions found for partition type %s, refusing.",
+                                                               partition_designator_to_string(type.designator));
+
+                                found = sl;
+                                found_uuid = u;
+                        }
+
+                        dev_t harder_devno = 0;
+                        r = resolve_copy_blocks_auto_candidate_harder(sl, type, restrict_devno, &harder_devno, &u);
+                        if (r < 0)
+                                return r;
+                        if (r > 0) {
+                                /* We found a matching one! */
+                                if (found != 0 && found != harder_devno)
                                         return log_error_errno(SYNTHETIC_ERRNO(ENOTUNIQ),
                                                                "Multiple matching partitions found, refusing.");
 
-                                found = sl;
+                                found = harder_devno;
                                 found_uuid = u;
                         }
                 }
@@ -7387,7 +7500,8 @@ static int resolve_copy_blocks_auto(
 
         if (found == 0)
                 return log_error_errno(SYNTHETIC_ERRNO(ENXIO),
-                                       "Unable to automatically discover suitable partition to copy blocks from.");
+                                       "Unable to automatically discover suitable partition to copy blocks from for partition type %s.",
+                                       partition_designator_to_string(type.designator));
 
         if (ret_devno)
                 *ret_devno = found;
@@ -7582,6 +7696,29 @@ static bool need_fstab(const Context *context) {
         return false;
 }
 
+static int make_by_uuid_symlink_path(const Partition *p, char **ret) {
+        _cleanup_free_ char *what = NULL;
+
+        assert(p);
+        assert(ret);
+
+        if (streq_ptr(p->format, "vfat")) {
+                if (asprintf(&what, "UUID=%04X-%04X",
+                             ((uint32_t) p->fs_uuid.bytes[0] << 8) |
+                             ((uint32_t) p->fs_uuid.bytes[1] << 0),
+                             ((uint32_t) p->fs_uuid.bytes[2] << 8) |
+                             ((uint32_t) p->fs_uuid.bytes[3])) < 0) /* Take first 32 bytes of UUID */
+                        return log_oom();
+        } else {
+                what = strjoin("UUID=", SD_ID128_TO_UUID_STRING(p->fs_uuid));
+                if (!what)
+                        return log_oom();
+        }
+
+        *ret = TAKE_PTR(what);
+        return 0;
+}
+
 static int context_fstab(Context *context) {
         _cleanup_(unlink_and_freep) char *t = NULL;
         _cleanup_fclose_ FILE *f = NULL;
@@ -7615,9 +7752,9 @@ static int context_fstab(Context *context) {
                 if (!need_fstab_one(p))
                         continue;
 
-                what = strjoin("UUID=", SD_ID128_TO_UUID_STRING(p->fs_uuid));
-                if (!what)
-                        return log_oom();
+                r = make_by_uuid_symlink_path(p, &what);
+                if (r < 0)
+                        return r;
 
                 FOREACH_ARRAY(mountpoint, p->mountpoints, p->n_mountpoints) {
                         r = partition_pick_mount_options(
@@ -7672,6 +7809,10 @@ static int context_fstab(Context *context) {
         default:
                 assert_not_reached();
         }
+
+        r = fchmod_umask(fileno(f), 0666);
+        if (r < 0)
+                return log_error_errno(r, "Failed to adjust access mode of generated fstab file: %m");
 
         r = flink_tmpfile(f, t, path, IN_SET(arg_append_fstab, APPEND_AUTO, APPEND_REPLACE) ? LINK_TMPFILE_REPLACE : 0);
         if (r < 0)

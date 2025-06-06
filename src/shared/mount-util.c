@@ -45,7 +45,7 @@ int umount_recursive_full(const char *prefix, int flags, char **keep) {
 
         f = fopen("/proc/self/mountinfo", "re"); /* Pin the file, in case we unmount /proc/ as part of the logic here */
         if (!f)
-                return log_debug_errno(errno, "Failed to open /proc/self/mountinfo: %m");
+                return log_debug_errno(errno, "Failed to open %s: %m", "/proc/self/mountinfo");
 
         for (;;) {
                 _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
@@ -454,7 +454,7 @@ int bind_remount_one(const char *path, unsigned long new_flags, unsigned long fl
 
         proc_self_mountinfo = fopen("/proc/self/mountinfo", "re");
         if (!proc_self_mountinfo)
-                return log_debug_errno(errno, "Failed to open /proc/self/mountinfo: %m");
+                return log_debug_errno(errno, "Failed to open %s: %m", "/proc/self/mountinfo");
 
         return bind_remount_one_with_mountinfo(path, new_flags, flags_mask, proc_self_mountinfo);
 }
@@ -1854,11 +1854,11 @@ int make_fsmount(
         if (mnt_fd < 0)
                 return log_full_errno(error_log_level, errno, "Failed to create mount fd for \"%s\" (\"%s\"): %m", what, type);
 
-        if (mount_setattr(mnt_fd, "", AT_EMPTY_PATH|AT_RECURSIVE,
-                          &(struct mount_attr) {
-                                  .attr_set = ms_flags_to_mount_attr(f) | (userns_fd >= 0 ? MOUNT_ATTR_IDMAP : 0),
-                                  .userns_fd = userns_fd,
-                          }, MOUNT_ATTR_SIZE_VER0) < 0)
+        struct mount_attr ma = {
+                .attr_set = ms_flags_to_mount_attr(f) | (userns_fd >= 0 ? MOUNT_ATTR_IDMAP : 0),
+                .userns_fd = userns_fd,
+        };
+        if (ma.attr_set != 0 && mount_setattr(mnt_fd, "", AT_EMPTY_PATH|AT_RECURSIVE, &ma, MOUNT_ATTR_SIZE_VER0) < 0)
                 return log_full_errno(error_log_level,
                                       errno,
                                       "Failed to set mount flags for \"%s\" (\"%s\"): %m",
@@ -1983,7 +1983,7 @@ int path_is_network_fs_harder_at(int dir_fd, const char *path) {
                 return r;
 
         _cleanup_free_ char *fstype = NULL, *options = NULL;
-        r = path_get_mount_info_at(fd, /* path = */ NULL, &fstype, &options, /* source = */ NULL);
+        r = path_get_mount_info_at(fd, /* path = */ NULL, &fstype, &options, /* ret_source = */ NULL);
         if (r < 0)
                 return r;
 
