@@ -218,7 +218,7 @@ static int version_check(int fd_from, const char *from, int fd_to, const char *t
                                         "Skipping \"%s\", it's owned by another boot loader.", to);
 
         r = compare_version(a, b);
-        log_debug("Comparing versions: \"%s\" %s \"%s", a, comparison_operator(r), b);
+        log_debug("Comparing versions: \"%s\" %s \"%s\"", a, comparison_operator(r), b);
         if (r < 0)
                 return log_warning_errno(SYNTHETIC_ERRNO(ESTALE),
                                          "Skipping \"%s\", newer boot loader version in place already.", to);
@@ -880,7 +880,7 @@ static int install_variables(
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
-                return log_error_errno(r, "Cannot access \"%s/%s\": %m", esp_path, path);
+                return log_error_errno(r, "Cannot access \"%s/%s\": %m", esp_path, skip_leading_slash(path));
 
         r = find_slot(uuid, path, &slot);
         if (r < 0) {

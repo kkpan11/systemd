@@ -1169,14 +1169,9 @@ static int mount_set_mount_command(Mount *m, ExecCommand *c, const MountParamete
         if (r < 0)
                 return r;
 
-        if (remount) {
-                if (isempty(opts)) {
-                        opts = strdup("remount");
-                        if (!opts)
-                                return -ENOMEM;
-                } else if (!strprepend(&opts, "remount,"))
+        if (remount)
+                if (!strprepend_with_separator(&opts, ",", "remount"))
                         return -ENOMEM;
-        }
 
         if (!isempty(opts)) {
                 r = exec_command_append(c, "-o", opts, NULL);
@@ -2034,10 +2029,9 @@ static void mount_enumerate_perpetual(Manager *m) {
         u = manager_get_unit(m, SPECIAL_ROOT_MOUNT);
         if (!u) {
                 r = unit_new_for_name(m, sizeof(Mount), SPECIAL_ROOT_MOUNT, &u);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to allocate the special " SPECIAL_ROOT_MOUNT " unit: %m");
-                        return;
-                }
+                if (r < 0)
+                        return (void) log_error_errno(r, "Failed to allocate the special %s unit: %m",
+                                                      SPECIAL_ROOT_MOUNT);
         }
 
         u->perpetual = true;

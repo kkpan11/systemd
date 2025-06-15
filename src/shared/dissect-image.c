@@ -67,6 +67,7 @@
 #include "time-util.h"
 #include "udev-util.h"
 #include "user-util.h"
+#include "varlink-util.h"
 #include "xattr-util.h"
 
 /* how many times to wait for the device nodes to appear */
@@ -4421,6 +4422,7 @@ int verity_dissect_and_mount(
                         r = extension_release_validate(
                                         dissected_image->image_name,
                                         extension_release_data->os_release_id,
+                                        extension_release_data->os_release_id_like,
                                         extension_release_data->os_release_version_id,
                                         class == IMAGE_SYSEXT ? extension_release_data->os_release_sysext_level : extension_release_data->os_release_confext_level,
                                         extension_release_data->os_release_extension_scope,
@@ -4447,6 +4449,7 @@ void extension_release_data_done(ExtensionReleaseData *data) {
         assert(data);
 
         data->os_release_id = mfree(data->os_release_id);
+        data->os_release_id_like = mfree(data->os_release_id_like);
         data->os_release_version_id = mfree(data->os_release_version_id);
         data->os_release_sysext_level = mfree(data->os_release_sysext_level);
         data->os_release_confext_level = mfree(data->os_release_confext_level);
@@ -4584,7 +4587,7 @@ int mountfsd_mount_image(
         }
 
         sd_json_variant *reply = NULL;
-        r = sd_varlink_callbo(
+        r = varlink_callbo_and_log(
                         vl,
                         "io.systemd.MountFileSystem.MountImage",
                         &reply,
@@ -4596,9 +4599,7 @@ int mountfsd_mount_image(
                         SD_JSON_BUILD_PAIR_CONDITION(!!ps, "imagePolicy", SD_JSON_BUILD_STRING(ps)),
                         SD_JSON_BUILD_PAIR("allowInteractiveAuthentication", SD_JSON_BUILD_BOOLEAN(FLAGS_SET(flags, DISSECT_IMAGE_ALLOW_INTERACTIVE_AUTH))));
         if (r < 0)
-                return log_error_errno(r, "Failed to call MountImage() varlink call: %m");
-        if (!isempty(error_id))
-                return log_error_errno(sd_varlink_error_to_errno(error_id, reply), "Failed to call MountImage() varlink call: %s", error_id);
+                return r;
 
         r = sd_json_dispatch(reply, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &p);
         if (r < 0)
@@ -4721,7 +4722,7 @@ int mountfsd_mount_directory(
 
         sd_json_variant *reply = NULL;
         const char *error_id = NULL;
-        r = sd_varlink_callbo(
+        r = varlink_callbo_and_log(
                         vl,
                         "io.systemd.MountFileSystem.MountDirectory",
                         &reply,
@@ -4733,9 +4734,7 @@ int mountfsd_mount_directory(
                                                           FLAGS_SET(flags, DISSECT_IMAGE_IDENTITY_UID) ? "identity" : "auto"),
                         SD_JSON_BUILD_PAIR_BOOLEAN("allowInteractiveAuthentication", FLAGS_SET(flags, DISSECT_IMAGE_ALLOW_INTERACTIVE_AUTH)));
         if (r < 0)
-                return log_error_errno(r, "Failed to call MountDirectory() varlink call: %m");
-        if (!isempty(error_id))
-                return log_error_errno(sd_varlink_error_to_errno(error_id, reply), "Failed to call MountDirectory() varlink call: %s", error_id);
+                return r;
 
         static const sd_json_dispatch_field dispatch_table[] = {
                 { "mountFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint, 0, SD_JSON_MANDATORY },
