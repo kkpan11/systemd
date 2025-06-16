@@ -631,12 +631,14 @@ static void unit_clear_dependencies(Unit *u) {
                                 hashmap_remove(other_deps, u);
 
                         unit_add_to_gc_queue(other);
+                        other->dependency_generation++;
                 }
 
                 hashmap_free(deps);
         }
 
         u->dependencies = hashmap_free(u->dependencies);
+        u->dependency_generation++;
 }
 
 static void unit_remove_transient(Unit *u) {
@@ -1094,6 +1096,9 @@ static void unit_merge_dependencies(Unit *u, Unit *other) {
         }
 
         other->dependencies = hashmap_free(other->dependencies);
+
+        u->dependency_generation++;
+        other->dependency_generation++;
 }
 
 int unit_merge(Unit *u, Unit *other) {
@@ -3088,6 +3093,7 @@ static int unit_add_dependency_impl(
                         return r;
 
                 flags = NOTIFY_DEPENDENCY_UPDATE_FROM;
+                u->dependency_generation++;
         }
 
         if (other_info.data != other_info_old.data) {
@@ -3104,6 +3110,7 @@ static int unit_add_dependency_impl(
                 }
 
                 flags |= NOTIFY_DEPENDENCY_UPDATE_TO;
+                other->dependency_generation++;
         }
 
         return flags;
@@ -3388,7 +3395,7 @@ int unit_set_slice(Unit *u, Unit *slice) {
         /* Disallow slice changes if @u is already bound to cgroups */
         if (UNIT_GET_SLICE(u)) {
                 CGroupRuntime *crt = unit_get_cgroup_runtime(u);
-                if (crt && crt->cgroup_realized)
+                if (crt && crt->cgroup_path)
                         return -EBUSY;
         }
 
@@ -4245,7 +4252,7 @@ static int unit_verify_contexts(const Unit *u) {
             exec_needs_mount_namespace(ec, /* params = */ NULL, /* runtime = */ NULL))
                 return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "WorkingDirectory= may not be below /proc/, /sys/ or /dev/ when using mount namespacing. Refusing.");
 
-        if (exec_needs_pid_namespace(ec) && !UNIT_VTABLE(u)->notify_pidref)
+        if (exec_needs_pid_namespace(ec, /* params= */ NULL) && !UNIT_VTABLE(u)->notify_pidref)
                 return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "PrivatePIDs= setting is only supported for service units. Refusing.");
 
         const KillContext *kc = unit_get_kill_context(u);
@@ -5618,6 +5625,9 @@ void unit_remove_dependencies(Unit *u, UnitDependencyMask mask) {
                                 /* The unit 'other' may not be wanted by the unit 'u'. */
                                 unit_submit_to_stop_when_unneeded_queue(other);
 
+                                u->dependency_generation++;
+                                other->dependency_generation++;
+
                                 done = false;
                                 break;
                         }
@@ -5996,16 +6006,17 @@ static int unit_log_leftover_process_stop(const PidRef *pid, int sig, void *user
 }
 
 int unit_warn_leftover_processes(Unit *u, bool start) {
+        _cleanup_free_ char *cgroup = NULL;
+        int r;
+
         assert(u);
 
-        (void) unit_pick_cgroup_path(u);
-
-        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
-        if (!crt || !crt->cgroup_path)
-                return 0;
+        r = unit_get_cgroup_path_with_fallback(u, &cgroup);
+        if (r < 0)
+                return r;
 
         return cg_kill_recursive(
-                        crt->cgroup_path,
+                        cgroup,
                         /* sig= */ 0,
                         /* flags= */ 0,
                         /* killed_pids= */ NULL,

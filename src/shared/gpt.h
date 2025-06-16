@@ -36,6 +36,14 @@ PartitionDesignator partition_verity_sig_of(PartitionDesignator p) _const_;
 PartitionDesignator partition_verity_to_data(PartitionDesignator d) _const_;
 PartitionDesignator partition_verity_sig_to_data(PartitionDesignator d) _const_;
 
+static inline bool partition_designator_is_verity(PartitionDesignator d) {
+        return partition_verity_to_data(d) >= 0;
+}
+
+static inline bool partition_designator_is_verity_sig(PartitionDesignator d) {
+        return partition_verity_sig_to_data(d) >= 0;
+}
+
 const char* partition_designator_to_string(PartitionDesignator d) _const_;
 PartitionDesignator partition_designator_from_string(const char *name) _pure_;
 

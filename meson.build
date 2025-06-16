@@ -486,13 +486,6 @@ if get_option('b_sanitize') == 'none'
         possible_link_flags += '-Wl,--warn-common'
 endif
 
-if cc.get_id() == 'clang'
-        possible_common_cc_flags += [
-                '-Wno-typedef-redefinition',
-                '-Wno-gnu-variable-sized-type-not-at-end',
-        ]
-endif
-
 if get_option('mode') == 'release'
         # We could enable 'pattern' for developer mode, but that can interfere with
         # valgrind and sanitizer builds. Also, clang does not zero-initialize unions,
@@ -581,7 +574,7 @@ assert(long_max > 100000)
 conf.set_quoted('LONG_MAX_STR', '@0@'.format(long_max))
 
 foreach ident : [
-        ['struct dirent64',   '''##include <dirent.h>'''],      # for musl, but only for compile time check, see dirent-util.h
+        ['struct dirent64',   '''#include <dirent.h>'''],       # for musl, but only for compile time check, see dirent-util.h
         ['struct sched_attr', '''#include <sched.h>'''],        # since glibc-2.41
 ]
         # We get -1 if the size cannot be determined
@@ -809,6 +802,11 @@ endif
 if conf.get('SYSTEM_ALLOC_GID_MIN') >= conf.get('SYSTEM_GID_MAX')
         error('Invalid gid allocation range')
 endif
+
+greeter_uid_min = get_option('greeter-uid-min')
+greeter_uid_max = get_option('greeter-uid-max')
+conf.set('GREETER_UID_MIN', greeter_uid_min)
+conf.set('GREETER_UID_MAX', greeter_uid_max)
 
 dynamic_uid_min = get_option('dynamic-uid-min')
 dynamic_uid_max = get_option('dynamic-uid-max')
@@ -1120,7 +1118,9 @@ else
 endif
 
 libmount = dependency('mount',
-                      version : fuzzer_build ? '>= 0' : '>= 2.30')
+                      version : fuzzer_build ? '>= 0' : '>= 2.30',
+                      disabler : true,
+                      required : get_option('libmount'))
 
 libfdisk = dependency('fdisk',
                       version : '>= 2.32',
@@ -2091,14 +2091,11 @@ if static_libsystemd != 'false'
                 install_tag: 'libsystemd',
                 install_dir : libdir,
                 pic : static_libsystemd_pic,
-                dependencies : [libblkid,
-                                libcap,
+                dependencies : [libcap,
                                 libdl,
                                 libgcrypt_cflags,
                                 liblz4_cflags,
                                 libm,
-                                libmount,
-                                libopenssl,
                                 librt,
                                 libxz_cflags,
                                 libzstd_cflags,
@@ -2620,7 +2617,7 @@ foreach dict : modules
         if is_nss
                 # We cannot use shared_module because it does not support version suffix.
                 # Unfortunately shared_library insists on creating the symlink…
-                meson.add_install_script(sh, '-c', 'rm $DESTDIR@0@/lib@1@.so'.format(libdir, name),
+                meson.add_install_script(sh, '-c', 'rm -f $DESTDIR@0@/lib@1@.so'.format(libdir, name),
                                          install_tag : 'nss')
                 nss_targets += lib
         endif
@@ -2951,6 +2948,7 @@ summary({
                                                                          conf.get('SYSTEM_ALLOC_UID_MIN')),
         'system GIDs' :                     '<=@0@ (alloc >=@1@)'.format(conf.get('SYSTEM_GID_MAX'),
                                                                          conf.get('SYSTEM_ALLOC_GID_MIN')),
+        'greeter UIDs' :                    '@0@…@1@'.format(greeter_uid_min, greeter_uid_max),
         'dynamic UIDs' :                    '@0@…@1@'.format(dynamic_uid_min, dynamic_uid_max),
         'container UID bases' :             '@0@…@1@'.format(container_uid_base_min, container_uid_base_max),
         'foreign UID base' :                '@0@'.format(foreign_uid_base),
